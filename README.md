@@ -5,11 +5,13 @@ This project implements synthetic control analysis for blockchain metrics.
 ## Setup
 
 1. Install dependencies:
+
    ```bash
-   pipenv install
+   pipenv install -r requirements.txt
    ```
 
 2. Activate virtual environment:
+
    ```bash
    pipenv shell
    ```
