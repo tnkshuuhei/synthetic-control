@@ -1,3 +1,5 @@
+# scripts/counterfactual.py
+
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Any
@@ -23,82 +25,121 @@ class SynthControlResponse:
     data: List[Dict[str, Any]]
 
 def create_synth_control(df: pd.DataFrame, request: SynthControlRequest) -> SynthControlResponse:
-    """
-    Synthetic Control分析を実行する関数
-    """
+    """合成制御分析を実行する関数"""
+    # データの前処理
+    df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
     
+    # デバッグ情報の出力
+    print(f"データセットの大きさ: {df.shape}")
+    print(f"ユニークな日付の数: {df['date'].nunique()}")
+    print(f"利用可能なメトリクス: {df['metric_key'].unique()}")
+    
+    # トレーニング期間のマスク
     train_mask = (
         (df['date'] >= request.time_predictors_prior_start) & 
         (df['date'] <= request.time_predictors_prior_end)
     )
     
-    treatment_data = df[df['origin_key'] == request.treatment_identifier]
-    control_data = df[df['origin_key'].isin(request.controls_identifier)]
+    # トレーニングデータの件数を確認
+    print(f"トレーニングデータの件数: {train_mask.sum()}")
     
-    X_control = []
-    y_treatment = []
+    # 処理用の配列を初期化
+    feature_matrix = []
+    control_names = []
     
-    for predictor in request.predictors:
-        treatment_values = treatment_data[train_mask][
-            treatment_data['metric_key'] == predictor
-        ]['value'].values
-        y_treatment.extend(treatment_values)
-        
-        for control in request.controls_identifier:
-            control_values = control_data[train_mask][
-                (control_data['origin_key'] == control) & 
-                (control_data['metric_key'] == predictor)
+    # 各制御群について特徴量を収集
+    for control in request.controls_identifier:
+        control_features = []
+        for predictor in request.predictors:
+            predictor_values = df[
+                (df['metric_key'] == predictor) & 
+                (df['origin_key'] == control) &
+                train_mask
             ]['value'].values
-            X_control.append(control_values)
+            
+            if len(predictor_values) > 0:
+                control_features.append(predictor_values)
+                
+        if len(control_features) == len(request.predictors):
+            feature_matrix.append(np.mean(control_features, axis=0))
+            control_names.append(control)
     
-    X_control = np.array(X_control).T
-    y_treatment = np.array(y_treatment)
+    # 処置群のデータを収集
+    treatment_values = []
+    for predictor in request.predictors:
+        pred_values = df[
+            (df['metric_key'] == predictor) & 
+            (df['origin_key'] == request.treatment_identifier) &
+            train_mask
+        ]['value'].values
+        
+        if len(pred_values) > 0:
+            treatment_values.append(pred_values)
     
+    # データの形状を確認
+    if not feature_matrix or not treatment_values:
+        raise ValueError("データが不十分です")
+    
+    # データを行列形式に変換
+    X_control = np.array(feature_matrix).T
+    y_treatment = np.mean(treatment_values, axis=0)
+    
+    print(f"特徴量行列の形状: {X_control.shape}")
+    print(f"目的変数の形状: {y_treatment.shape}")
+    
+    # スケーリング
     scaler = StandardScaler()
     X_control_scaled = scaler.fit_transform(X_control)
     y_treatment_scaled = scaler.fit_transform(y_treatment.reshape(-1, 1)).ravel()
     
+    # モデルの学習
     model = LassoCV(positive=True, cv=5)
     model.fit(X_control_scaled, y_treatment_scaled)
     
+    # 重みの計算
     weights = {}
-    for control, weight in zip(request.controls_identifier, model.coef_):
-        if weight > 0.001:  # Remove small weights
+    for control, weight in zip(control_names, model.coef_):
+        if weight > 0.001:
             weights[control] = float(weight)
     
+    # 重みの正規化
     total_weight = sum(weights.values())
-    weights = {k: v/total_weight for k, v in weights.items()}
+    if total_weight > 0:
+        weights = {k: v/total_weight for k, v in weights.items()}
     
+    # 予測データの準備
     prediction_data = []
     dates = sorted(df['date'].unique())
     
     for date in dates:
-        actual = float(treatment_data[
-            (treatment_data['date'] == date) & 
-            (treatment_data['metric_key'] == request.dependent)
-        ]['value'].iloc[0]) if len(treatment_data[
-            (treatment_data['date'] == date) & 
-            (treatment_data['metric_key'] == request.dependent)
+        treatment_value = df[
+            (df['metric_key'] == request.dependent) & 
+            (df['origin_key'] == request.treatment_identifier) & 
+            (df['date'] == date)
+        ]['value'].iloc[0] if len(df[
+            (df['metric_key'] == request.dependent) & 
+            (df['origin_key'] == request.treatment_identifier) & 
+            (df['date'] == date)
         ]) > 0 else 0
         
-        synthetic = 0
+        synthetic_value = 0
         for control, weight in weights.items():
-            control_value = float(control_data[
-                (control_data['date'] == date) & 
-                (control_data['origin_key'] == control) & 
-                (control_data['metric_key'] == request.dependent)
-            ]['value'].iloc[0]) if len(control_data[
-                (control_data['date'] == date) & 
-                (control_data['origin_key'] == control) & 
-                (control_data['metric_key'] == request.dependent)
+            control_value = df[
+                (df['metric_key'] == request.dependent) & 
+                (df['origin_key'] == control) & 
+                (df['date'] == date)
+            ]['value'].iloc[0] if len(df[
+                (df['metric_key'] == request.dependent) & 
+                (df['origin_key'] == control) & 
+                (df['date'] == date)
             ]) > 0 else 0
-            synthetic += weight * control_value
+            synthetic_value += weight * control_value
         
         prediction_data.append({
             'date': date.strftime('%Y-%m-%d'),
-            'treatment': actual,
-            'synthetic': synthetic
+            'treatment': float(treatment_value),
+            'synthetic': float(synthetic_value)
         })
     
     return SynthControlResponse(weights=weights, data=prediction_data)
